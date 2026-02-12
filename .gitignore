@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Reports / outputs
+*.json
+*.html
+*.ghost
+*.ghost.info
+alerts.jsonl
+*.log
+
+# IDE
+.vscode/
+.idea/
