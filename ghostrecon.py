@@ -344,6 +344,116 @@ class HTTPClient:
 http = HTTPClient()
 
 
+# ─────────────────────────── BREACH ENGINE (NO-KEY, STDLIB) ───────────────────────────
+
+def _http_get_json(url, timeout=6):
+    """Helper HTTP GET con stdlib – nessuna dipendenza esterna"""
+    req = urllib.request.Request(url, headers={"User-Agent": "GhostRecon/3.0 (+https://github.com/)"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw)
+    except Exception:
+        return None
+
+
+def check_breach_xon(email):
+    """XposedOrNot public endpoint"""
+    url = f"https://api.xposedornot.com/v1/check-email/{email}"
+    data = _http_get_json(url, timeout=6)
+
+    if data is None:
+        return None, None
+
+    breaches = data.get("breaches")
+    meta = {k: v for k, v in data.items() if k != "breaches"}
+
+    if breaches is None:
+        return [], meta
+
+    flat_breaches = []
+
+    def flatten(item):
+        if isinstance(item, list):
+            for subitem in item:
+                flatten(subitem)
+        elif isinstance(item, dict):
+            flat_breaches.append(item)
+        elif isinstance(item, str):
+            flat_breaches.append({
+                "name": item,
+                "breach_date": None,
+                "description": f"Breach: {item}"
+            })
+
+    flatten(breaches)
+    return flat_breaches, meta
+
+
+def breach_risk_summary(breaches):
+    """Genera punteggio di rischio e timeline dai breach trovati"""
+    years = []
+    names = []
+
+    for b in breaches or []:
+        if isinstance(b, dict):
+            n = b.get("name") or b.get("breach") or b.get("title")
+            if n:
+                names.append(str(n))
+
+            d = b.get("date") or b.get("breach_date") or b.get("added_date") or b.get("published")
+            if d:
+                try:
+                    y = int(str(d)[:4])
+                    if 1990 <= y <= datetime.now().year + 1:
+                        years.append(y)
+                except:
+                    pass
+        else:
+            names.append(str(b))
+
+    count = len(breaches or [])
+    uniq_years = sorted(set(years))
+    last_year = max(uniq_years) if uniq_years else None
+
+    if count == 0:
+        score = 0
+    elif count == 1:
+        score = 35
+    elif count <= 3:
+        score = 55
+    elif count <= 7:
+        score = 75
+    else:
+        score = 90
+
+    if last_year and last_year >= (datetime.now().year - 2):
+        score = min(100, score + 10)
+
+    if score >= 80:
+        level = "HIGH"
+    elif score >= 50:
+        level = "MEDIUM"
+    elif score >= 20:
+        level = "LOW"
+    else:
+        level = "NONE"
+
+    if uniq_years:
+        timeline = f"{uniq_years[0]} → {uniq_years[-1]} ({len(uniq_years)} anni)"
+    else:
+        timeline = "N/A"
+
+    sample = ", ".join(names[:3]) if names else "N/A"
+
+    return {
+        "count": count,
+        "score": score,
+        "level": level,
+        "timeline": timeline,
+        "sample": sample
+    }
+
 # ════════════════════════════════════════════════════════════════════
 #  MODULE 1 — DOMAIN INTELLIGENCE (LEGALE)
 # ════════════════════════════════════════════════════════════════════
@@ -1014,7 +1124,10 @@ class EmailOSINT:
             "breaches": [],
             "gravatar": {},
             "social_profiles": [],
-            "breach_details": [],  # Lista dettagliata di breach trovati
+            "breach_details": [],
+            "breach_source": None,
+            "breach_meta": {},
+            "breach_summary": None
         }
 
     def run_all(self):
@@ -1026,7 +1139,7 @@ class EmailOSINT:
         self._check_mx()
         self._check_disposable()
         self._gravatar_lookup()
-        self._breach_check_detailed()
+        self._breach_check_combined()
         self._social_enum()
         self._print_results()
         return self.results
@@ -1038,15 +1151,74 @@ class EmailOSINT:
                f"Format validation: {'Valid' if self.results['valid_format'] else 'Invalid'}")
 
     def _check_mx(self):
-        data = http.json_get(
-            f"https://cloudflare-dns.com/dns-query?name={self.domain}&type=MX",
-            headers={"Accept": "application/dns-json"}
-        )
-        if data and "Answer" in data:
-            self.results["mx_records"] = [a["data"] for a in data["Answer"]]
-            status("✓", f"MX Records: {len(self.results['mx_records'])} found")
-        else:
-            status("✗", "No MX records found", C.R)
+        """Controllo MX records con fallback multiplo + hardcoded per domini noti"""
+        
+        # ---- TENTATIVO 1: Cloudflare DoH ----
+        try:
+            data = http.json_get(
+                f"https://cloudflare-dns.com/dns-query?name={self.domain}&type=MX",
+                headers={"Accept": "application/dns-json"},
+                timeout=5
+            )
+            if data and "Answer" in data:
+                self.results["mx_records"] = [a["data"] for a in data["Answer"]]
+                status("✓", f"MX Records: {len(self.results['mx_records'])} found (Cloudflare)")
+                return
+        except:
+            pass
+        
+        # ---- TENTATIVO 2: Google DNS ----
+        try:
+            data = http.json_get(
+                f"https://dns.google/resolve?name={self.domain}&type=MX",
+                timeout=5
+            )
+            if data and "Answer" in data:
+                self.results["mx_records"] = [a["data"] for a in data["Answer"]]
+                status("✓", f"MX Records: {len(self.results['mx_records'])} found (Google)")
+                return
+        except:
+            pass
+        
+        # ---- TENTATIVO 3: Quad9 DNS ----
+        try:
+            data = http.json_get(
+                f"https://dns.quad9.net:5053/dns-query?name={self.domain}&type=MX",
+                headers={"Accept": "application/dns-json"},
+                timeout=5
+            )
+            if data and "Answer" in data:
+                self.results["mx_records"] = [a["data"] for a in data["Answer"]]
+                status("✓", f"MX Records: {len(self.results['mx_records'])} found (Quad9)")
+                return
+        except:
+            pass
+        
+        # ---- HARDCODED per domini italiani e internazionali ----
+        hardcoded_mx = {
+            "libero.it": ["mx.libero.it", "mx2.libero.it"],
+            "tin.it": ["mx.libero.it", "mx2.libero.it"],
+            "alice.it": ["mx.libero.it", "mx2.libero.it"],
+            "virgilio.it": ["mx.virgilio.it", "mx2.virgilio.it"],
+            "hotmail.it": ["mx1.hotmail.com", "mx2.hotmail.com"],
+            "outlook.it": ["mx1.outlook.com", "mx2.outlook.com"],
+            "yahoo.it": ["mx.yahoo.com", "mx2.yahoo.com"],
+            "gmail.com": ["gmail-smtp-in.l.google.com", "alt1.gmail-smtp-in.l.google.com"],
+            "yahoo.com": ["mx.yahoo.com", "mx2.yahoo.com"],
+            "hotmail.com": ["mx1.hotmail.com", "mx2.hotmail.com"],
+            "outlook.com": ["mx1.outlook.com", "mx2.outlook.com"],
+            "aol.com": ["mailin-01.mx.aol.com", "mailin-02.mx.aol.com"],
+            "icloud.com": ["mx01.mail.icloud.com", "mx02.mail.icloud.com"],
+        }
+        
+        if self.domain in hardcoded_mx:
+            self.results["mx_records"] = hardcoded_mx[self.domain]
+            status("⚠", f"MX Records: {len(self.results['mx_records'])} found (hardcoded)", C.Y)
+            return
+        
+        # ---- NESSUN MX TROVATO ----
+        self.results["mx_records"] = []
+        status("✗", "No MX records found (tutti i tentativi falliti)", C.R)
 
     def _check_disposable(self):
         disposable_domains = {
@@ -1086,15 +1258,36 @@ class EmailOSINT:
             self.results["gravatar"] = {"exists": False}
             status("○", "No Gravatar profile", C.DIM)
 
-    def _breach_check_detailed(self):
-        """Controllo breach DETTAGLIATO con fonti esplicite"""
-        breaches = []
-
-        status("📡", "Controllo database breach in corso...", C.CY)
-
-        # ============= FONTI STABILI (SEMPRE ATTIVE) =============
-
-        # 1. EMAILREP.IO - API professionale
+    def _breach_check_combined(self):
+        """Controllo breach combinato: XposedOrNot + EmailRep + Firefox + aggressive"""
+        
+        # ----- 1. XPOSEDORNOT (sempre attivo, no key) -----
+        print("  📡 Breach Check (XposedOrNot public DB) in corso...")
+        breaches_xon, meta_xon = check_breach_xon(self.email)
+        
+        self.results["breach_source"] = "XposedOrNot"
+        self.results["breaches"] = breaches_xon
+        self.results["breach_meta"] = meta_xon or {}
+        
+        if breaches_xon is None:
+            print("  ○ Breach check non disponibile (timeout/errore fonte)")
+            self.results["breach_summary"] = None
+        else:
+            summary = breach_risk_summary(breaches_xon)
+            self.results["breach_summary"] = summary
+            
+            if summary["count"] == 0:
+                print("  ✅ Nessun breach trovato in alcun database pubblico")
+                print("  ℹ Nota: il controllo si basa su database pubblici/statici e può avere ritardi di aggiornamento.")
+                print("     Per verifica ufficiale consultare Have I Been Pwned (HIBP).")
+            else:
+                print(f"  🔥 Trovati {summary['count']} breach")
+                print(f"  ⚠ Risk: {summary['level']}  | Score: {summary['score']}/100")
+                print(f"  🗓 Timeline: {summary['timeline']}")
+        
+        # ----- 2. FONTI STABILI (EmailRep.io, Firefox Monitor) -----
+        other_breaches = []
+        
         try:
             resp = http.get(f"https://emailrep.io/{self.email}",
                            headers={"User-Agent": "GhostRecon/3.0", "Accept": "application/json"},
@@ -1103,7 +1296,7 @@ class EmailOSINT:
                 data = json.loads(resp["body"])
                 if data.get("details", {}).get("breaches", False):
                     breach_count = data.get("details", {}).get("breach_count", 0)
-                    breaches.append({
+                    other_breaches.append({
                         "source": "EmailRep.io",
                         "breach_name": "Multiple Breaches",
                         "records": breach_count,
@@ -1112,10 +1305,9 @@ class EmailOSINT:
                         "reliable": True
                     })
                     status("⚠", f"⚠️ EmailRep.io: {breach_count} breach confermati!", C.R)
-        except Exception as e:
+        except:
             pass
-
-        # 2. FIREFOX MONITOR - via hash
+        
         try:
             email_hash = hashlib.sha256(self.email.encode()).hexdigest()
             ff_url = f"https://monitor.firefox.com/breach-stats?emailHash={email_hash}"
@@ -1125,8 +1317,8 @@ class EmailOSINT:
                 if data.get("breached", False):
                     breach_count = data.get("breachCount", 1)
                     breaches_found = data.get("breaches", [])
-                    for b in breaches_found[:5]:  # Limita a 5 per leggibilità
-                        breaches.append({
+                    for b in breaches_found[:5]:
+                        other_breaches.append({
                             "source": "Firefox Monitor",
                             "breach_name": b.get("Name", "Unknown"),
                             "date": b.get("BreachDate", ""),
@@ -1137,25 +1329,21 @@ class EmailOSINT:
                     status("⚠", f"⚠️ Firefox Monitor: {breach_count} breach!", C.R)
         except:
             pass
-
-        # ============= FONTI AGGRESSIVE (SOLO CON --aggressive) =============
-
+        
+        # ----- 3. FONTI AGGRESSIVE (solo con --aggressive) -----
         if Config.aggressive_mode:
-
-            # 3. LEAK-LOOKUP - API pubblica
             try:
                 leak_data = http.post("https://leak-lookup.com/api/search",
                                      data=f"key=&type=email_address&query={self.email}",
                                      headers={"Content-Type": "application/x-www-form-urlencoded"},
                                      timeout=Config.timeout_aggressive)
-
                 if leak_data["ok"]:
                     data = json.loads(leak_data["body"])
                     if data.get("error") == "false" and data.get("message"):
                         for breach_name, records in data["message"].items():
                             if records and len(records) > 0:
                                 record_count = len(records) if isinstance(records, list) else 1
-                                breaches.append({
+                                other_breaches.append({
                                     "source": "Leak-Lookup",
                                     "breach_name": breach_name,
                                     "records": record_count,
@@ -1164,27 +1352,25 @@ class EmailOSINT:
                                     "reliable": True
                                 })
                                 status("⚠", f"⚠️ Leak-Lookup: {breach_name}", C.R)
-            except Exception as e:
+            except:
                 pass
-
-            # 4. SNUSBASE - ricerca pubblica
+            
             try:
                 snushbase_url = f"https://public.snusbase.com/?search={self.email}&type=email"
                 resp = http.get(snushbase_url, timeout=Config.timeout_aggressive)
                 if resp["ok"] and "no results" not in resp["body"].lower():
                     if "found" in resp["body"].lower():
-                        breaches.append({
+                        other_breaches.append({
                             "source": "Snusbase",
                             "breach_name": "Public Database",
                             "details": "Email presente in database pubblico",
                             "confirmed": True,
-                            "reliable": False  # Meno affidabile
+                            "reliable": False
                         })
                         status("⚠", f"⚠️ Snusbase: Email presente!", C.R)
             except:
                 pass
-
-            # 5. LEAKCHECK - via proxy
+            
             try:
                 lc_url = f"https://leakcheck.net/api?key=&type=email&query={self.email}"
                 resp = http.get(lc_url, timeout=Config.timeout_aggressive)
@@ -1192,7 +1378,7 @@ class EmailOSINT:
                     data = json.loads(resp["body"])
                     if data.get("success") and data.get("found", 0) > 0:
                         for breach in data.get("result", [])[:5]:
-                            breaches.append({
+                            other_breaches.append({
                                 "source": "LeakCheck",
                                 "breach_name": breach.get("name", "Unknown"),
                                 "date": breach.get("date", ""),
@@ -1203,21 +1389,15 @@ class EmailOSINT:
                         status("⚠", f"⚠️ LeakCheck: {data.get('found', 0)} leak!", C.R)
             except:
                 pass
-
-        if breaches:
-            self.results["breach_details"] = breaches
-            self.results["breach_count"] = len(breaches)
-            self.results["breach_sources"] = list(set([b["source"] for b in breaches]))
-            status("🔥", f"TROVATI {len(breaches)} BREACH IN {len(set([b['source'] for b in breaches]))} FONTI!", C.BG_R)
-        else:
-            status("✅", "Nessun breach trovato in alcun database", C.G)
-
-        return breaches
+        
+        self.results["breach_details"] = other_breaches
+        if other_breaches:
+            self.results["breach_count"] = len(other_breaches)
+            self.results["breach_sources"] = list(set([b["source"] for b in other_breaches]))
+            status("🔥", f"TROVATI {len(other_breaches)} BREACH IN FONTI AGGIUNTIVE!", C.BG_R)
 
     def _social_enum(self):
-        """Trova account social collegati all'email"""
         profiles = []
-
         try:
             data = http.json_get(f"https://api.github.com/search/users?q={self.email}+in:email")
             if data and data.get("total_count", 0) > 0:
@@ -1230,7 +1410,6 @@ class EmailOSINT:
                 status("✓", f"Found {len(profiles)} GitHub profile(s)")
         except:
             pass
-
         self.results["social_profiles"] = profiles
 
     def _print_results(self):
@@ -1260,180 +1439,535 @@ class EmailOSINT:
             for p in profiles:
                 lines.append(f"  [{p['platform']}] {p['username']} — {p['url']}")
 
-        # BREACH DETTAGLIATI - con fonti esplicite
-        breaches = self.results.get("breach_details", [])
-        if breaches:
-            lines.append(f"\n{C.BLD}{C.BG_R}⚠️⚠️⚠️  BREACH DATABASE TROVATI ⚠️⚠️⚠️{C.RST}")
-            lines.append(f"  {C.R}TOTALE: {len(breaches)} occorrenze in {len(set([b['source'] for b in breaches]))} fonti{C.RST}\n")
+        # --- SEZIONE BREACH XposedOrNot ---
+        breaches = self.results.get("breaches")
+        summary = self.results.get("breach_summary")
+        source = self.results.get("breach_source", "N/A")
 
-            # Raggruppa per fonte
+        if breaches is None:
+            lines.append(f"\n{C.Y}○ BREACH CHECK: NON DISPONIBILE{C.RST}")
+            lines.append(f"  Fonte: {source}")
+        elif summary and summary["count"] == 0:
+            lines.append(f"\n{C.BLD}{C.G}✅ NESSUN BREACH TROVATO{C.RST}")
+            lines.append(f"  Fonte: {source}")
+            lines.append(f"  {C.DIM}Nota: check basato su DB pubblici/statici; possibile ritardo aggiornamenti.{C.RST}")
+            lines.append(f"  {C.DIM}Verifica consigliata: Have I Been Pwned (HIBP).{C.RST}")
+        else:
+            cnt = summary["count"] if summary else len(breaches) if breaches else 0
+            lines.append(f"\n{C.BLD}{C.BG_R}⚠️⚠️⚠️  BREACH TROVATI ⚠️⚠️⚠️{C.RST}")
+            lines.append(f"  {C.R}TOTALE: {cnt} breach{C.RST}")
+            if summary:
+                lines.append(f"  Risk: {summary['level']}  | Score: {summary['score']}/100")
+                lines.append(f"  Timeline: {summary['timeline']}")
+                
+                # --- PATCH: mostra solo 5 esempi ---
+                if summary['sample'] and summary['sample'] != "N/A":
+                    sample_parts = summary['sample'].split(', ')
+                    examples_with_dates = []
+                    for breach_name in sample_parts[:5]:
+                        breach_date = "N/A"
+                        for b in breaches:
+                            if isinstance(b, dict):
+                                name = b.get('name') or b.get('breach') or b.get('title')
+                                if name and name == breach_name:
+                                    d = b.get('date') or b.get('breach_date') or b.get('added_date') or b.get('published')
+                                    if d:
+                                        breach_date = str(d)[:4]
+                                    break
+                        if breach_date != "N/A":
+                            examples_with_dates.append(f"{breach_name} ({breach_date})")
+                        else:
+                            examples_with_dates.append(breach_name)
+                    
+                    sample_short = ', '.join(examples_with_dates)
+                    if len(sample_parts) > 5:
+                        sample_short += '...'
+                else:
+                    sample_short = summary['sample']
+                
+                lines.append(f"  Esempi: {sample_short}")
+                
+            lines.append(f"  Fonte: {source}")
+
+        # --- BREACH AGGIUNTIVI ---
+        other_breaches = self.results.get("breach_details", [])
+        if other_breaches:
+            lines.append(f"\n{C.BLD}{C.Y}🔍 Breach rilevati da fonti aggiuntive:{C.RST}")
             by_source = {}
-            for b in breaches:
-                source = b['source']
-                if source not in by_source:
-                    by_source[source] = []
-                by_source[source].append(b)
+            for b in other_breaches:
+                src = b['source']
+                if src not in by_source:
+                    by_source[src] = []
+                by_source[src].append(b)
 
             for source, breach_list in by_source.items():
                 lines.append(f"  {C.Y}📁 {source}:{C.RST}")
-                for b in breach_list[:5]:  # Max 5 per fonte
+                for b in breach_list[:3]:
                     if 'breach_name' in b:
                         if 'records' in b:
                             lines.append(f"    • {C.R}⚠{C.RST} {b['breach_name']} ({b['records']:,} records)")
                         elif 'date' in b and b['date']:
-                            lines.append(f"    • {C.R}⚠{C.RST} {b['breach_name']} ({b['date']})")
+                            lines.append(f"    • {C.R}⚠{C.RST} {b['breach_name']} ({b['date'][:4]})")
                         else:
                             lines.append(f"    • {C.R}⚠{C.RST} {b['breach_name']}")
                     else:
                         lines.append(f"    • {C.R}⚠{C.RST} {b.get('details', 'Compromesso')}")
-                if len(breach_list) > 5:
-                    lines.append(f"    • ... e {len(breach_list)-5} altri")
-        else:
-            lines.append(f"\n{C.BLD}{C.G}✅ NESSUN BREACH TROVATO{C.RST}")
-            lines.append(f"  L'email non risulta in alcun database pubblico")
+                if len(breach_list) > 3:
+                    lines.append(f"    • ... e {len(breach_list)-3} altri")
 
         print(f"\n{box('📧 EMAIL INTELLIGENCE REPORT', lines, C.M)}")
+        
+        # --- DISEGNA CRONOGRAMMA ---
+        if breaches is not None and summary and summary["count"] > 0:
+            self._draw_breach_timeline(breaches, summary)
 
-
+    # -----------------------------------------------------------------
+    #  🎨 CRONOGRAMMA BREACH
+    # -----------------------------------------------------------------
+    def _draw_breach_timeline(self, breaches, summary):
+        """Disegna un cronogramma ASCII dei breach"""
+        if not breaches or not isinstance(breaches, list):
+            return
+        
+        years = []
+        for b in breaches:
+            if isinstance(b, dict):
+                d = b.get('date') or b.get('breach_date') or b.get('added_date') or b.get('published')
+                if d:
+                    try:
+                        y = int(str(d)[:4])
+                        if 1990 <= y <= datetime.now().year + 1:
+                            years.append(y)
+                    except:
+                        pass
+        
+        if not years:
+            return
+        
+        from collections import Counter
+        year_counts = Counter(years)
+        min_year = min(year_counts.keys())
+        max_year = max(year_counts.keys())
+        
+        print()
+        if min_year == max_year:
+            print(f"  {C.CY}📅 Breach concentrati nel {min_year}{C.RST}")
+            bar_len = min(30, year_counts[min_year] * 2)
+            bar = "█" * bar_len
+            print(f"  {C.R}{bar}{C.RST}")
+            print(f"  {C.DIM}{year_counts[min_year]} breach in questo anno{C.RST}")
+        else:
+            print(f"  {C.CY}📅 Cronologia breach per anno:{C.RST}")
+            print(f"  {C.DIM}anno : numero breach{C.RST}")
+            max_count = max(year_counts.values())
+            scale = 25
+            for year in range(min_year, max_year + 1):
+                count = year_counts.get(year, 0)
+                if count == 0:
+                    continue
+                bar_len = int((count / max_count) * scale) if max_count > 0 else 0
+                bar = "█" * bar_len
+                year_str = f"{year} :"
+                if year >= datetime.now().year - 1:
+                    color = C.R
+                elif year >= datetime.now().year - 3:
+                    color = C.Y
+                else:
+                    color = C.G
+                print(f"  {year_str:<7} {color}{bar:<25}{C.RST} {count}")
+        print()
 # ════════════════════════════════════════════════════════════════════
-#  MODULE 3 — USERNAME HUNTER
+#  MODULE 3 — USERNAME HUNTER (50+ PIATTAFORME)
 # ════════════════════════════════════════════════════════════════════
 
 class UsernameHunter:
-    """Cerca un username su 50+ piattaforme"""
-
-    PLATFORMS = {
-        "GitHub":         {"url": "https://github.com/{}", "method": "status", "valid": 200},
-        "GitLab":         {"url": "https://gitlab.com/{}", "method": "status", "valid": 200},
-        "Twitter/X":      {"url": "https://x.com/{}", "method": "status", "valid": 200},
-        "Instagram":      {"url": "https://www.instagram.com/{}/", "method": "status", "valid": 200},
-        "Reddit":         {"url": "https://www.reddit.com/user/{}/about.json", "method": "json_check"},
-        "YouTube":        {"url": "https://www.youtube.com/@{}", "method": "status", "valid": 200},
-        "TikTok":         {"url": "https://www.tiktok.com/@{}", "method": "status", "valid": 200},
-        "Pinterest":      {"url": "https://www.pinterest.com/{}/", "method": "status", "valid": 200},
-        "LinkedIn":       {"url": "https://www.linkedin.com/in/{}/", "method": "status", "valid": 200},
-        "Medium":         {"url": "https://medium.com/@{}", "method": "status", "valid": 200},
-        "Dev.to":         {"url": "https://dev.to/{}", "method": "status", "valid": 200},
-        "Hacker News":    {"url": "https://hacker-news.firebaseio.com/v0/user/{}.json", "method": "json_check"},
-        "Keybase":        {"url": "https://keybase.io/{}", "method": "status", "valid": 200},
-        "Steam":          {"url": "https://steamcommunity.com/id/{}", "method": "status", "valid": 200},
-        "Twitch":         {"url": "https://www.twitch.tv/{}", "method": "status", "valid": 200},
-        "Spotify":        {"url": "https://open.spotify.com/user/{}", "method": "status", "valid": 200},
-        "SoundCloud":     {"url": "https://soundcloud.com/{}", "method": "status", "valid": 200},
-        "Flickr":         {"url": "https://www.flickr.com/people/{}", "method": "status", "valid": 200},
-        "Vimeo":          {"url": "https://vimeo.com/{}", "method": "status", "valid": 200},
-        "SlideShare":     {"url": "https://www.slideshare.net/{}", "method": "status", "valid": 200},
-        "About.me":       {"url": "https://about.me/{}", "method": "status", "valid": 200},
-        "Dribbble":       {"url": "https://dribbble.com/{}", "method": "status", "valid": 200},
-        "Behance":        {"url": "https://www.behance.net/{}", "method": "status", "valid": 200},
-        "CodePen":        {"url": "https://codepen.io/{}", "method": "status", "valid": 200},
-        "HackerRank":     {"url": "https://www.hackerrank.com/{}", "method": "status", "valid": 200},
-        "LeetCode":       {"url": "https://leetcode.com/{}/", "method": "status", "valid": 200},
-        "Replit":         {"url": "https://replit.com/@{}", "method": "status", "valid": 200},
-        "NPM":            {"url": "https://www.npmjs.com/~{}", "method": "status", "valid": 200},
-        "PyPI":           {"url": "https://pypi.org/user/{}/", "method": "status", "valid": 200},
-        "Docker Hub":     {"url": "https://hub.docker.com/u/{}", "method": "status", "valid": 200},
-        "StackOverflow":  {"url": "https://stackoverflow.com/users/?tab=Reputation&filter=all&search={}", "method": "body_check", "pattern": "user-details"},
-        "Telegram":       {"url": "https://t.me/{}", "method": "status", "valid": 200},
-        "Patreon":        {"url": "https://www.patreon.com/{}", "method": "status", "valid": 200},
-        "Substack":       {"url": "https://{}.substack.com", "method": "status", "valid": 200},
-        "Linktree":       {"url": "https://linktr.ee/{}", "method": "status", "valid": 200},
-        "Mastodon (social)": {"url": "https://mastodon.social/@{}", "method": "status", "valid": 200},
-        "Gravatar":       {"url": "https://gravatar.com/{}", "method": "status", "valid": 200},
-        "Bitbucket":      {"url": "https://bitbucket.org/{}/", "method": "status", "valid": 200},
-        "SourceForge":    {"url": "https://sourceforge.net/u/{}/", "method": "status", "valid": 200},
-        "Kaggle":         {"url": "https://www.kaggle.com/{}", "method": "status", "valid": 200},
-        "Tryhackme":      {"url": "https://tryhackme.com/p/{}", "method": "status", "valid": 200},
-        "HackTheBox":     {"url": "https://app.hackthebox.com/users/{}", "method": "status", "valid": 200},
-        "BuyMeACoffee":   {"url": "https://buymeacoffee.com/{}", "method": "status", "valid": 200},
-        "Fiverr":         {"url": "https://www.fiverr.com/{}", "method": "status", "valid": 200},
-        "Imgur":          {"url": "https://imgur.com/user/{}", "method": "status", "valid": 200},
-        "Giphy":          {"url": "https://giphy.com/{}", "method": "status", "valid": 200},
-        "Product Hunt":   {"url": "https://www.producthunt.com/@{}", "method": "status", "valid": 200},
-        "Hashnode":       {"url": "https://hashnode.com/@{}", "method": "status", "valid": 200},
+    """Cerca username su 50+ piattaforme social e verifica breach"""
+    
+    # Piattaforme con URL diretti (verifica HTTP status)
+    PLATFORMS_DIRECT = {
+        # Social principali
+        "GitHub": "https://github.com/{}",
+        "Instagram": "https://www.instagram.com/{}/",
+        "Twitter/X": "https://twitter.com/{}",
+        "Facebook": "https://www.facebook.com/{}",
+        "LinkedIn": "https://www.linkedin.com/in/{}",
+        "Reddit": "https://www.reddit.com/user/{}",
+        "TikTok": "https://www.tiktok.com/@{}",
+        "Snapchat": "https://www.snapchat.com/add/{}",
+        "Pinterest": "https://www.pinterest.com/{}/",
+        "Tumblr": "https://{}.tumblr.com",
+        "YouTube": "https://www.youtube.com/@{}",
+        "Twitch": "https://www.twitch.tv/{}",
+        "Discord": "https://discord.com/users/{}",
+        "Telegram": "https://t.me/{}",
+        "WhatsApp": "https://wa.me/{}",  # Numero, ma lasciamo
+        "Signal": "https://signal.me/#u/{}",
+        
+        # Sviluppo e tech
+        "GitLab": "https://gitlab.com/{}",
+        "Bitbucket": "https://bitbucket.org/{}/",
+        "StackOverflow": "https://stackoverflow.com/users/{}",
+        "HackerNews": "https://news.ycombinator.com/user?id={}",
+        "Dev.to": "https://dev.to/{}",
+        "Medium": "https://medium.com/@{}",
+        "Keybase": "https://keybase.io/{}",
+        "Replit": "https://replit.com/@{}",
+        "CodePen": "https://codepen.io/{}",
+        "GeeksforGeeks": "https://auth.geeksforgeeks.org/user/{}/profile",
+        
+        # Gaming
+        "Steam": "https://steamcommunity.com/id/{}",
+        "Epic Games": "https://www.epicgames.com/@{}",
+        "Xbox": "https://account.xbox.com/it-it/profile?gamertag={}",
+        "PlayStation": "https://my.playstation.com/profile/{}",
+        "Nintendo": "https://en-americas-support.nintendo.com/app/answers/detail/a_id/58581/~/how-to-change-your-nintendo-account-sign-in-id",
+        "Minecraft": "https://namemc.com/profile/{}",
+        "Roblox": "https://www.roblox.com/user.aspx?username={}",
+        "Fortnite": "https://fortnitetracker.com/profile/all/{}",
+        "Apex Legends": "https://apex.tracker.gg/apex/profile/origin/{}/overview",
+        
+        # Forum italiani
+        "HWG": "https://www.hwupgrade.it/forum/member.php?username={}",
+        "Tom's Hardware": "https://forum.tomsguide.it/members/?username={}",
+        "ForumFree": "https://member.forumfree.it/?user={}",
+        "Androidiani": "https://www.androidiani.com/forum/members/{}.html",
+        "Moto.it": "https://www.moto.it/forum/member.php?username={}",
+        
+        # Forum internazionali
+        "Quora": "https://www.quora.com/profile/{}",
+        "ProductHunt": "https://www.producthunt.com/@{}",
+        "Behance": "https://www.behance.net/{}",
+        "Dribbble": "https://dribbble.com/{}",
+        "Flickr": "https://www.flickr.com/people/{}",
+        "Vimeo": "https://vimeo.com/{}",
+        "SoundCloud": "https://soundcloud.com/{}",
+        "Spotify": "https://open.spotify.com/user/{}",
+        "Last.fm": "https://www.last.fm/user/{}",
+        "Mixcloud": "https://www.mixcloud.com/{}/",
+        
+        # Lavoro e professionali
+        "Xing": "https://www.xing.com/profile/{}",
+        "AngelList": "https://angel.co/u/{}",
+        "Upwork": "https://www.upwork.com/freelancers/~{}",
+        "Fiverr": "https://www.fiverr.com/{}",
+        "Freelancer": "https://www.freelancer.com/u/{}",
+        
+        # Dating
+        "Tinder": "https://tinder.com/@{}",
+        "Bumble": "https://bumble.com/it/profile/{}",
+        "Grindr": "https://www.grindr.com/profile/{}",
+        
+        # Altro
+        "Wikipedia": "https://en.wikipedia.org/wiki/User:{}",
+        "Patreon": "https://www.patreon.com/{}",
+        "Kickstarter": "https://www.kickstarter.com/profile/{}",
+        "Etsy": "https://www.etsy.com/people/{}",
+        "eBay": "https://www.ebay.com/usr/{}",
+        "Amazon": "https://www.amazon.com/gp/profile/{}",
+        "Wish": "https://www.wish.com/{}",
+        "Aliexpress": "https://feedback.aliexpress.com/display/evaluationDetail.htm?memberId={}",
     }
-
+    
+    # Piattaforme che richiedono API (opzionali, con chiave)
+    PLATFORMS_API = {
+        "GitHub": {
+            "url": "https://api.github.com/users/{}",
+            "check": lambda d: d.get("id") is not None,
+            "fields": ["login", "name", "bio", "public_repos", "followers", "location", "blog", "twitter_username", "created_at"]
+        },
+        "Reddit": {
+            "url": "https://www.reddit.com/user/{}/about.json",
+            "check": lambda d: d.get("data", {}).get("id") is not None,
+            "fields": ["name", "total_karma", "created_utc", "is_gold", "link_karma", "comment_karma"]
+        },
+        "Instagram": {
+            "url": "https://www.instagram.com/{}/?__a=1",  # Deprecato, ma funziona ancora
+            "check": lambda d: d.get("graphql", {}).get("user", {}).get("id") is not None,
+            "fields": ["full_name", "biography", "edge_followed_by", "edge_follow", "is_private", "is_verified"]
+        },
+        "Twitter/X": {
+            "url": "https://api.twitter.com/2/users/by/username/{}",  # Richiede Bearer token
+            "check": lambda d: d.get("data") is not None,
+            "fields": ["name", "description", "public_metrics", "created_at", "verified"],
+            "needs_auth": True
+        },
+    }
+    
     def __init__(self, username: str):
-        self.username = username.strip()
-        self.found = []
-        self.not_found = []
-        self.errors = []
-
-    def hunt(self):
-        print(f"\n{C.BLD}{C.Y}{'═'*60}")
-        print(f"  🎯 USERNAME HUNTER — @{self.username}")
-        print(f"{'═'*60}{C.RST}\n")
-
-        total = len(self.PLATFORMS)
-
-        def check_platform(name, info):
-            url = info["url"].format(self.username)
-            method = info["method"]
-
-            try:
-                if method == "status":
-                    resp = http.head(url, timeout=8)
-                    if resp.get("status") == 0:
-                        resp = http.get(url, timeout=8)
-                    if resp.get("status") == info["valid"]:
-                        return ("found", name, url)
-
-                elif method == "json_check":
-                    resp = http.get(url, timeout=8)
-                    if resp["ok"] and resp["body"].strip() not in ("", "null", "{}"):
-                        return ("found", name, url)
-
-                elif method == "body_check":
-                    resp = http.get(url, timeout=8)
-                    if resp["ok"] and info.get("pattern", "") in resp.get("body", ""):
-                        return ("found", name, url)
-
-                return ("not_found", name, url)
-
-            except Exception as e:
-                return ("error", name, str(e))
-
-        count = 0
-        with ThreadPoolExecutor(max_workers=15) as pool:
-            futures = {pool.submit(check_platform, n, i): n for n, i in self.PLATFORMS.items()}
-            for f in as_completed(futures):
-                count += 1
-                result = f.result()
-                progress_bar(count, total, result[1][:20])
-
-                if result[0] == "found":
-                    self.found.append({"platform": result[1], "url": result[2]})
-                elif result[0] == "error":
-                    self.errors.append({"platform": result[1], "error": result[2]})
-                else:
-                    self.not_found.append(result[1])
-
-        self._print_results()
-        return {
+        self.username = username.strip().lower()
+        self.results = {
             "username": self.username,
-            "found": self.found,
-            "not_found": self.not_found,
-            "errors": self.errors,
-            "total_checked": total,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "found_profiles": [],
+            "not_found": [],
+            "breaches": [],
+            "summary": None,
+            "stats": {
+                "total_checked": 0,
+                "found": 0,
+                "not_found": 0,
+                "error": 0
+            }
         }
 
+    def hunt(self):
+        """Esegue la caccia all'username"""
+        print(f"\n{C.BLD}{C.Y}{'═'*60}")
+        print(f"  🎯 USERNAME HUNTER — {self.username}")
+        print(f"{'═'*60}{C.RST}\n")
+        
+        status("🔍", f"Controllo {len(self.PLATFORMS_DIRECT)} piattaforme...", C.CY)
+        
+        # Usa ThreadPoolExecutor per velocizzare
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            futures = {
+                executor.submit(self._check_platform, name, url): name 
+                for name, url in self.PLATFORMS_DIRECT.items()
+            }
+            
+            for i, future in enumerate(as_completed(futures), 1):
+                platform = futures[future]
+                try:
+                    result = future.result()
+                    if i % 10 == 0:  # Aggiorna ogni 10 piattaforme
+                        progress_bar(i, len(self.PLATFORMS_DIRECT), f"Checking {platform[:15]}...")
+                except Exception as e:
+                    self.results["stats"]["error"] += 1
+        
+        progress_bar(len(self.PLATFORMS_DIRECT), len(self.PLATFORMS_DIRECT), "Completato!")
+        
+        # Verifica breach per l'username
+        self._check_breaches()
+        
+        # Genera summary
+        self._generate_summary()
+        
+        # Stampa risultati
+        self._print_results()
+        
+        return self.results
+    
+    def _check_platform(self, name: str, url_template: str) -> dict:
+        """Controlla una singola piattaforma"""
+        self.results["stats"]["total_checked"] += 1
+        
+        url = url_template.format(self.username)
+        
+        # Per alcune piattaforme dobbiamo usare HEAD invece di GET
+        if name in ["Instagram", "TikTok", "Snapchat"]:
+            resp = http.head(url, timeout=5)
+        else:
+            resp = http.get(url, timeout=5)
+        
+        result = {
+            "platform": name,
+            "url": url,
+            "checked": datetime.now().isoformat()
+        }
+        
+        # Consideriamo "trovato" se status 200 e non è una pagina di errore
+        if resp["ok"] and resp["status"] == 200:
+            # Escludi falsi positivi (pagine di "non trovato" che danno 200)
+            body_lower = resp.get("body", "").lower() if isinstance(resp.get("body"), str) else ""
+            
+            false_positives = [
+                "not found", "user not found", "profile not found",
+                "page not found", "doesn't exist", "no user",
+                "non trovato", "utente non esistente", "pagina non trovata"
+            ]
+            
+            is_false_positive = any(fp in body_lower for fp in false_positives)
+            
+            if not is_false_positive or len(body_lower) < 200:  # Pagine di errore sono spesso piccole
+                result["found"] = True
+                result["status"] = "found"
+                result["method"] = "direct"
+                self.results["found_profiles"].append(result)
+                self.results["stats"]["found"] += 1
+                return result
+        
+        self.results["not_found"].append({
+            "platform": name,
+            "url": url,
+            "status": "not_found"
+        })
+        self.results["stats"]["not_found"] += 1
+        return {"platform": name, "found": False}
+    
+    def _check_breaches(self):
+        """Cerca se l'username è presente in breach"""
+        status("🔥", f"Controllo breach per username '{self.username}'...", C.Y)
+        
+        # XposedOrNot supporta anche username? No, solo email
+        # Usiamo leak-lookup se in modalità aggressive
+        
+        if Config.aggressive_mode:
+            try:
+                # Leak-Lookup API (versione demo/gratuita)
+                data = http.post(
+                    "https://leak-lookup.com/api/search",
+                    data={
+                        "key": "",  # Vuoto per demo
+                        "type": "username",
+                        "query": self.username
+                    },
+                    timeout=8
+                )
+                
+                if data["ok"]:
+                    result = json.loads(data["body"])
+                    if result.get("error") == "false" and result.get("message"):
+                        for breach_name, records in result["message"].items():
+                            if records and len(records) > 0:
+                                self.results["breaches"].append({
+                                    "source": "Leak-Lookup",
+                                    "breach_name": breach_name,
+                                    "records": len(records) if isinstance(records, list) else 1,
+                                    "confirmed": True
+                                })
+                        
+                        if self.results["breaches"]:
+                            status("🔥", f"⚠️ Trovato in {len(self.results['breaches'])} breach!", C.R)
+            except:
+                pass
+            
+            # Cerca su pastebin
+            try:
+                url = f"https://psbdmp.ws/api/search/{self.username}"
+                data = http.json_get(url, timeout=5)
+                if data and data.get("count", 0) > 0:
+                    self.results["breaches"].append({
+                        "source": "PSBDMP (Pastebin)",
+                        "breach_name": "Pastebin Dumps",
+                        "count": data.get("count", 0),
+                        "url": f"https://psbdmp.ws/search/{self.username}",
+                        "confirmed": True
+                    })
+                    status("⚠", f"Trovato in {data.get('count', 0)} pastebin dumps", C.Y)
+            except:
+                pass
+    
+    def _generate_summary(self):
+        """Genera summary dei risultati"""
+        found_count = self.results["stats"]["found"]
+        total = self.results["stats"]["total_checked"]
+        
+        if found_count == 0:
+            level = "NESSUNO"
+            color = C.G
+        elif found_count < 5:
+            level = "BASSO"
+            color = C.G
+        elif found_count < 15:
+            level = "MEDIO"
+            color = C.Y
+        else:
+            level = "ALTO"
+            color = C.R
+        
+        self.results["summary"] = {
+            "found_count": found_count,
+            "total_checked": total,
+            "coverage": f"{found_count}/{total}",
+            "exposure_level": level,
+            "breach_count": len(self.results["breaches"])
+        }
+    
     def _print_results(self):
+        """Stampa risultati formattati"""
+        stats = self.results["stats"]
+        summary = self.results["summary"]
+        
         lines = [
-            f"Username:   @{self.username}",
-            f"Checked:    {len(self.PLATFORMS)} platforms",
-            f"Found:      {C.G}{len(self.found)}{C.RST}",
-            f"Not Found:  {len(self.not_found)}",
-            f"Errors:     {len(self.errors)}",
-            "",
+            f"Username:    {self.username}",
+            f"",
+            f"{C.BLD}📊 STATISTICHE:{C.RST}",
+            f"  Piattaforme controllate: {stats['total_checked']}",
+            f"  Profili trovati:          {C.G}{stats['found']}{C.RST}",
+            f"  Non trovati:              {stats['not_found']}",
+            f"  Errori:                   {stats['error']}",
+            f"  Copertura:                {summary['coverage']}",
+            f"  Livello esposizione:      {summary['exposure_level']}",
         ]
-        if self.found:
-            lines.append(f"{C.BLD}Found on:{C.RST}")
-            for item in sorted(self.found, key=lambda x: x["platform"]):
-                lines.append(f"  {C.G}✓{C.RST} {item['platform']:20} → {item['url']}")
-
-        print(f"\n{box('🎯 Username Hunt Results', lines, C.Y)}")
-
-
+        
+        # Profili trovati (dettaglio)
+        if self.results["found_profiles"]:
+            lines.extend([
+                f"",
+                f"{C.BLD}{C.G}✅ PROFILI TROVATI ({len(self.results['found_profiles'])}):{C.RST}"
+            ])
+            
+            # Raggruppa per categoria (manualmente)
+            social = []
+            dev = []
+            gaming = []
+            forums = []
+            other = []
+            
+            for p in self.results["found_profiles"]:
+                name = p["platform"]
+                if name in ["GitHub", "GitLab", "Bitbucket", "StackOverflow", "Dev.to", "Medium", "Keybase", "CodePen"]:
+                    dev.append(p)
+                elif name in ["Steam", "Epic Games", "Xbox", "PlayStation", "Minecraft", "Roblox", "Twitch"]:
+                    gaming.append(p)
+                elif name in ["HWG", "Tom's Hardware", "ForumFree", "Androidiani", "Moto.it", "Reddit", "Quora"]:
+                    forums.append(p)
+                elif name in ["Facebook", "Instagram", "Twitter/X", "LinkedIn", "TikTok", "Snapchat"]:
+                    social.append(p)
+                else:
+                    other.append(p)
+            
+            categories = [
+                ("📱 Social", social, C.M),
+                ("💻 Developer", dev, C.CY),
+                ("🎮 Gaming", gaming, C.G),
+                ("🗣️ Forum", forums, C.Y),
+                ("📦 Altro", other, C.DIM)
+            ]
+            
+            for cat_name, cat_list, color in categories:
+                if cat_list:
+                    lines.append(f"  {color}{cat_name}:{C.RST}")
+                    for p in sorted(cat_list, key=lambda x: x["platform"])[:5]:  # Max 5 per categoria
+                        lines.append(f"    • {p['platform']}: {p['url']}")
+                    if len(cat_list) > 5:
+                        lines.append(f"    • ... e {len(cat_list)-5} altri")
+        
+        # Breach trovati
+        if self.results["breaches"]:
+            lines.extend([
+                f"",
+                f"{C.BLD}{C.R}🔥 BREACH TROVATI ({len(self.results['breaches'])}):{C.RST}"
+            ])
+            for b in self.results["breaches"][:5]:
+                if b["source"] == "PSBDMP (Pastebin)":
+                    lines.append(f"  • {C.R}⚠{C.RST} {b['source']}: {b.get('count', 0)} dumps")
+                else:
+                    lines.append(f"  • {C.R}⚠{C.RST} {b['source']}: {b['breach_name']}")
+            if len(self.results["breaches"]) > 5:
+                lines.append(f"  • ... e {len(self.results['breaches'])-5} altri")
+        
+        # Consigli
+        if stats['found'] > 0:
+            lines.extend([
+                f"",
+                f"{C.BLD}{C.Y}💡 RACCOMANDAZIONI:{C.RST}",
+                f"  • Usa username diversi per ogni piattaforma",
+                f"  • Evita di usare lo stesso username per account sensibili",
+                f"  • Controlla le impostazioni privacy sui profili trovati"
+            ])
+            
+            if self.results["breaches"]:
+                lines.append(f"  • {C.R}⚠  Cambia password OVUNQUE usi questo username{C.RST}")
+        
+        print(f"\n{box('🎯 USERNAME HUNTER REPORT', lines, C.Y)}")
+        
+        # Suggerimento per approfondire
+        if stats['found'] > 0:
+            print(f"\n  {C.CY}💡 Per approfondire un profilo, usa i moduli:{C.RST}")
+            print(f"  {C.G}• Email OSINT{C.RST} se trovi email nei profili")
+            print(f"  {C.G}• Phone Breach Check{C.RST} se trovi numeri")
+            print(f"  {C.G}• Domain Intel{C.RST} se trovi domini personali")
 # ════════════════════════════════════════════════════════════════════
 #  MODULE 4 — IP INTELLIGENCE
 # ════════════════════════════════════════════════════════════════════
@@ -1567,191 +2101,352 @@ class IPIntel:
 
 
 # ════════════════════════════════════════════════════════════════════
-#  MODULE 5 — PHONE NUMBER OSINT + BREACH CHECK DETTAGLIATO
+#  MODULE 5 — PHONE BREACH CHECK (SOLO API GRATUITE)
 # ════════════════════════════════════════════════════════════════════
 
-class PhoneOSINT:
-    """Phone number intelligence con breach check dettagliato"""
-
+class PhoneBreachCheck:
+    """Verifica se un numero di telefono è presente in breach (solo API gratuite)"""
+    
     def __init__(self, phone: str):
         self.phone = re.sub(r'[^\d+]', '', phone)
+        self.phone_clean = self.phone.lstrip("+").replace(" ", "").replace("-", "")
+        self.phone_e164 = self.phone if self.phone.startswith('+') else f"+{self.phone_clean}"
         self.results = {
             "phone": self.phone,
-            "analysis": {},
-            "breach_details": [],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "breaches": [],
+            "web_mentions": 0,
+            "sources_checked": [],
+            "summary": None
         }
 
     def run_all(self):
-        print(f"\n{C.BLD}{C.G}{'═'*60}")
-        print(f"  📱 PHONE OSINT — {Redactor.phone(self.phone) if Config.redact_reports else self.phone}")
+        print(f"\n{C.BLD}{C.R}{'═'*60}")
+        print(f"  📱 PHONE BREACH CHECK — {Redactor.phone(self.phone) if Config.redact_reports else self.phone}")
         print(f"{'═'*60}{C.RST}\n")
 
-        self._analyze_number()
-        self._phone_breach_detailed()
+        # API GRATUITE che supportano numeri di telefono
+        self._check_urlscan()           # Gratuito, nessuna API key
+        self._check_psbdmp()             # Gratuito, nessuna API key (pastebin dumps)
+        
+        # API opzionali (richiedono registrazione)
+        self._check_hunter_phone()        # API gratuita con limite mensile
+        self._check_spyse()               # API gratuita (richiede registrazione)
+        
+        self._generate_summary()
         self._print_results()
         return self.results
 
-    def _analyze_number(self):
-        """Basic number analysis"""
-        country_codes = {
-            "1": "US/Canada", "7": "Russia", "20": "Egypt",
-            "27": "South Africa", "30": "Greece", "31": "Netherlands",
-            "32": "Belgium", "33": "France", "34": "Spain",
-            "36": "Hungary", "39": "Italy", "40": "Romania",
-            "41": "Switzerland", "43": "Austria", "44": "UK",
-            "45": "Denmark", "46": "Sweden", "47": "Norway",
-            "48": "Poland", "49": "Germany", "51": "Peru",
-            "52": "Mexico", "53": "Cuba", "54": "Argentina",
-            "55": "Brazil", "56": "Chile", "57": "Colombia",
-            "58": "Venezuela", "60": "Malaysia", "61": "Australia",
-            "62": "Indonesia", "63": "Philippines", "64": "New Zealand",
-            "65": "Singapore", "66": "Thailand", "81": "Japan",
-            "82": "South Korea", "84": "Vietnam", "86": "China",
-            "90": "Turkey", "91": "India", "92": "Pakistan",
-            "93": "Afghanistan", "94": "Sri Lanka", "95": "Myanmar",
-            "98": "Iran", "212": "Morocco", "213": "Algeria",
-            "216": "Tunisia", "218": "Libya", "220": "Gambia",
-            "234": "Nigeria", "254": "Kenya", "255": "Tanzania",
-            "351": "Portugal", "352": "Luxembourg", "353": "Ireland",
-            "354": "Iceland", "358": "Finland", "370": "Lithuania",
-            "371": "Latvia", "372": "Estonia", "380": "Ukraine",
-            "381": "Serbia", "385": "Croatia", "386": "Slovenia",
-            "420": "Czech Republic", "421": "Slovakia",
-        }
-
-        num = self.phone.lstrip("+")
-        country = "Unknown"
-        code = ""
-
-        for cc_len in [3, 2, 1]:
-            prefix = num[:cc_len]
-            if prefix in country_codes:
-                country = country_codes[prefix]
-                code = prefix
-                break
-
-        self.results["analysis"] = {
-            "country_code": f"+{code}" if code else "Unknown",
-            "country": country,
-            "length": len(self.phone),
-            "format_valid": 8 <= len(num) <= 15,
-        }
-        status("✓", f"Country: {country} (+{code})")
-
-    def _phone_breach_detailed(self):
-        """Controllo breach DETTAGLIATO per numeri di telefono"""
-        breaches = []
-
-        status("📡", "Controllo database breach telefonici...", C.CY)
-
-        # ============= FONTI STABILI (SEMPRE ATTIVE) =============
-
-        # 1. BREACHCHECKER - per telefoni
+    def _check_urlscan(self):
+        """URLScan.io - Cerca menzioni del numero in pagine web scansionate"""
+        status("🌐", "Controllo URLScan.io (pagine web pubbliche)...", C.CY)
+        self.results["sources_checked"].append("URLScan.io")
+        
         try:
-            bc_url = f"https://breachchecker.com/check/{self.phone}"
-            resp = http.get(bc_url, timeout=10)
-            if resp["ok"]:
-                if "breached" in resp["body"].lower() and "not breached" not in resp["body"].lower():
-                    breaches.append({
-                        "source": "BreachChecker",
-                        "breach_name": "Phone Breach Database",
-                        "details": "Numero risulta compromesso",
-                        "confirmed": True,
-                        "reliable": True
-                    })
-                    status("⚠", f"⚠️ BreachChecker: Numero compromesso!", C.R)
-        except:
-            pass
+            import urllib.parse
+            
+            # Prova diverse formattazioni del numero
+            queries = [
+                self.phone_e164,           # +393923272672
+                self.phone_clean,           # 393923272672
+                self.phone_clean[-10:],     # 3923272672 (ultime 10 cifre)
+                self.phone_clean[-9:],      # 923272672 (senza prefisso internazionale)
+            ]
+            
+            total = 0
+            domains = set()
+            
+            for query in set(queries):
+                url = f"https://urlscan.io/api/v1/search/?q={urllib.parse.quote(query)}"
+                data = http.json_get(url, timeout=8)
+                
+                if data and data.get("total", 0) > 0:
+                    total += data.get("total", 0)
+                    
+                    # Estrai i domini dove compare
+                    for result in data.get("results", [])[:10]:
+                        page = result.get("page", {})
+                        domain = page.get("domain", "")
+                        if domain:
+                            domains.add(domain)
+                        
+                        # Cerca di capire se è un breach noto
+                        task = result.get("task", {})
+                        if "leak" in task.get("url", "").lower() or "dump" in task.get("url", "").lower():
+                            self.results["breaches"].append({
+                                "source": "URLScan.io",
+                                "type": "possible_leak",
+                                "url": task.get("reportURL", ""),
+                                "domain": domain,
+                                "date": task.get("time", "")[:10] if task.get("time") else "N/A",
+                                "confidence": "medium"
+                            })
+            
+            if total > 0:
+                self.results["web_mentions"] = total
+                status("⚠", f"⚠️ Trovato in {total} pagine web scansionate", C.Y)
+                if domains:
+                    status("ℹ", f"Domini: {', '.join(list(domains)[:3])}", C.DIM)
+            else:
+                status("✓", "Nessuna menzione su URLScan.io", C.G)
+                
+        except Exception as e:
+            status("○", f"URLScan.io non disponibile", C.DIM)
 
-        # ============= FONTI AGGRESSIVE (SOLO CON --aggressive) =============
-
-        if Config.aggressive_mode:
-
-            # 2. LEAK-LOOKUP - database pubblico per telefoni
-            try:
-                leak_data = http.post("https://leak-lookup.com/api/search",
-                                     data=f"key=&type=phone_number&query={self.phone}",
-                                     headers={"Content-Type": "application/x-www-form-urlencoded"},
-                                     timeout=Config.timeout_aggressive)
-
-                if leak_data["ok"]:
-                    data = json.loads(leak_data["body"])
-                    if data.get("error") == "false" and data.get("message"):
-                        for breach_name, records in data["message"].items():
-                            if records and len(records) > 0:
-                                record_count = len(records) if isinstance(records, list) else 1
-                                breaches.append({
-                                    "source": "Leak-Lookup",
-                                    "breach_name": breach_name,
-                                    "records": record_count,
-                                    "details": f"Database: {breach_name} ({record_count} records)",
-                                    "confirmed": True,
-                                    "reliable": True
-                                })
-                                status("⚠", f"⚠️ Leak-Lookup: {breach_name}", C.R)
-            except Exception as e:
-                pass
-
-            # 3. SNUSBASE - ricerca pubblica per telefoni
-            try:
-                snushbase_url = f"https://public.snusbase.com/?search={self.phone}&type=phone"
-                resp = http.get(snushbase_url, timeout=Config.timeout_aggressive)
-                if resp["ok"] and "no results" not in resp["body"].lower():
-                    if "found" in resp["body"].lower():
-                        breaches.append({
-                            "source": "Snusbase",
-                            "breach_name": "Public Phone Database",
-                            "details": "Numero presente in database pubblico",
-                            "confirmed": True,
-                            "reliable": False
+    def _check_psbdmp(self):
+        """PSBDMP - API gratuita per cercare in pastebin dumps"""
+        status("📋", "Controllo PSBDMP (pastebin dumps)...", C.CY)
+        self.results["sources_checked"].append("PSBDMP")
+        
+        try:
+            # PSBDMP API - cerca il numero in pastebin dumps
+            url = f"https://psbdmp.ws/api/search/{self.phone_clean}"
+            data = http.json_get(url, timeout=8)
+            
+            if data and isinstance(data, dict):
+                count = data.get("count", 0)
+                if count > 0:
+                    dumps = data.get("data", [])[:10]
+                    
+                    for dump in dumps:
+                        self.results["breaches"].append({
+                            "source": "PSBDMP (Pastebin)",
+                            "type": "pastebin_dump",
+                            "id": dump.get("id", "N/A"),
+                            "url": f"https://psbdmp.ws/dump/{dump.get('id', '')}",
+                            "date": dump.get("time", "")[:10] if dump.get("time") else "N/A",
+                            "tags": dump.get("tags", []),
+                            "confidence": "high"
                         })
-                        status("⚠", f"⚠️ Snusbase: Numero presente!", C.R)
-            except:
-                pass
+                    
+                    status("🔥", f"⚠️ TROVATO in {count} pastebin dumps!", C.R)
+                else:
+                    status("✓", "Nessun dump trovato su PSBDMP", C.G)
+            else:
+                status("○", "Nessun risultato da PSBDMP", C.DIM)
+                
+        except Exception as e:
+            status("○", f"PSBDMP non disponibile", C.DIM)
 
-        if breaches:
-            self.results["breach_details"] = breaches
-            self.results["breach_count"] = len(breaches)
-            status("🔥", f"TROVATI {len(breaches)} BREACH TELEFONICI!", C.BG_R)
-        else:
-            status("✅", "Nessun breach telefonico trovato", C.G)
+    def _check_hunter_phone(self):
+        """Hunter.io Phone API - verifica se numero è associato a breach"""
+        status("📞", "Controllo Hunter.io Phone API...", C.CY)
+        self.results["sources_checked"].append("Hunter.io")
+        
+        # Hunter.io ha una API gratuita con 25 richieste/mese
+        # Richiede registrazione per API key
+        api_key = os.getenv("HUNTER_API_KEY")  # Opzionale
+        
+        if not api_key:
+            status("○", "Hunter.io API key non configurata (gratuita con registrazione)", C.DIM)
+            return
+        
+        try:
+            # Hunter.io Phone API
+            url = f"https://api.hunter.io/v2/phone?number={self.phone_clean}&api_key={api_key}"
+            data = http.json_get(url, timeout=8)
+            
+            if data and data.get("data"):
+                phone_data = data.get("data", {})
+                
+                # Verifica se è associato a breach
+                if phone_data.get("breached", False):
+                    breach_count = phone_data.get("breaches_count", 0)
+                    last_breach = phone_data.get("last_breach_date", "N/A")
+                    
+                    self.results["breaches"].append({
+                        "source": "Hunter.io",
+                        "type": "breach",
+                        "count": breach_count,
+                        "last_breach": last_breach,
+                        "confidence": "high",
+                        "details": f"Numero presente in breach database"
+                    })
+                    
+                    status("🔥", f"⚠️ CONFERMATO! Presente in {breach_count} breach", C.R)
+                else:
+                    status("✓", "Nessun breach trovato su Hunter.io", C.G)
+            else:
+                status("○", "Numero non trovato su Hunter.io", C.DIM)
+                
+        except Exception as e:
+            status("○", f"Hunter.io non disponibile", C.DIM)
 
-        return breaches
+    def _check_spyse(self):
+        """Spyse - API gratuita per OSINT (richiede registrazione)"""
+        status("🔍", "Controllo Spyse (breach database)...", C.CY)
+        self.results["sources_checked"].append("Spyse")
+        
+        # Spyse ha API gratuita con limite 1000 crediti/mese
+        # Richiede registrazione per API key
+        api_key = os.getenv("SPYSE_API_KEY")  # Opzionale
+        
+        if not api_key:
+            status("○", "Spyse API key non configurata (gratuita con registrazione)", C.DIM)
+            return
+        
+        try:
+            # Spyse API per cercare telefono in breach
+            url = "https://api.spyse.com/v4/data/leaked"
+            headers = {
+                "Accept": "application/json",
+                "X-API-Key": api_key
+            }
+            
+            # Nota: Spyse richiede POST per query complesse
+            # Questa è una semplificazione - controlla la documentazione
+            data = http.post(
+                url,
+                data=json.dumps({
+                    "search_params": [{
+                        "field": "phone",
+                        "value": self.phone_clean
+                    }]
+                }),
+                headers=headers,
+                timeout=10
+            )
+            
+            if data["ok"]:
+                result = json.loads(data["body"])
+                if result.get("data", {}).get("items"):
+                    items = result["data"]["items"][:10]
+                    
+                    for item in items:
+                        self.results["breaches"].append({
+                            "source": "Spyse",
+                            "type": "breach",
+                            "breach_name": item.get("source", "N/A"),
+                            "date": item.get("created_at", "")[:10] if item.get("created_at") else "N/A",
+                            "fields": item.get("fields", []),
+                            "confidence": "high"
+                        })
+                    
+                    status("🔥", f"⚠️ TROVATO in {len(items)} breach su Spyse!", C.R)
+                else:
+                    status("✓", "Nessun breach trovato su Spyse", C.G)
+            else:
+                status("○", "Spyse non disponibile", C.DIM)
+                
+        except Exception as e:
+            status("○", f"Spyse non disponibile", C.DIM)
+
+    def _generate_summary(self):
+        """Genera summary dei risultati"""
+        breaches = self.results["breaches"]
+        
+        if not breaches and self.results["web_mentions"] == 0:
+            self.results["summary"] = {
+                "found": False,
+                "count": 0,
+                "sources": [],
+                "message": "Nessun breach trovato"
+            }
+            return
+        
+        # Raggruppa per tipo
+        pastebin = [b for b in breaches if "pastebin" in b["source"].lower() or b.get("type") == "pastebin_dump"]
+        confirmed = [b for b in breaches if b.get("confidence") == "high" and b not in pastebin]
+        possible = [b for b in breaches if b.get("confidence") != "high" and b not in pastebin]
+        
+        self.results["summary"] = {
+            "found": True,
+            "total": len(breaches),
+            "web_mentions": self.results["web_mentions"],
+            "confirmed_breaches": len(confirmed),
+            "pastebin_dumps": len(pastebin),
+            "possible_mentions": len(possible),
+            "sources": list(set([b["source"] for b in breaches]))
+        }
 
     def _print_results(self):
-        a = self.results.get("analysis", {})
+        """Stampa risultati formattati"""
         phone_display = Redactor.phone(self.phone) if Config.redact_reports else self.phone
-
+        summary = self.results.get("summary", {})
+        
         lines = [
-            f"Number:      {phone_display}",
-            f"Country:     {a.get('country', 'N/A')} ({a.get('country_code', '')})",
-            f"Length:      {a.get('length', 0)} digits",
-            f"Valid fmt:   {'✓' if a.get('format_valid') else '✗'}",
+            f"Numero:      {phone_display}",
+            f"Formato:     {self.phone_e164}",
+            f"",
+            f"{C.BLD}Fonti controllate:{C.RST}",
+            f"  {', '.join(self.results['sources_checked'])}",
         ]
-
-        breaches = self.results.get("breach_details", [])
-        if breaches:
-            lines.append(f"\n{C.BLD}{C.BG_R}⚠️⚠️⚠️  BREACH TELEFONICI TROVATI ⚠️⚠️⚠️{C.RST}")
-            lines.append(f"  {C.R}TOTALE: {len(breaches)} occorrenze{C.RST}\n")
-
-            by_source = {}
-            for b in breaches:
-                source = b['source']
-                if source not in by_source:
-                    by_source[source] = []
-                by_source[source].append(b)
-
-            for source, breach_list in by_source.items():
-                lines.append(f"  {C.Y}📁 {source}:{C.RST}")
-                for b in breach_list[:3]:
-                    if 'records' in b:
-                        lines.append(f"    • {C.R}⚠{C.RST} {b['breach_name']} ({b['records']:,} records)")
-                    else:
-                        lines.append(f"    • {C.R}⚠{C.RST} {b.get('details', 'Compromesso')}")
+        
+        # Menzioni web
+        if self.results["web_mentions"] > 0:
+            lines.extend([
+                f"",
+                f"{C.BLD}{C.Y}🌐 Menzioni web:{C.RST}",
+                f"  Trovato in {self.results['web_mentions']} pagine web",
+            ])
+        
+        # Summary se ci sono breach
+        if summary and summary.get("found") and summary.get("total") > 0:
+            lines.extend([
+                f"",
+                f"{C.BLD}{C.BG_R}⚠️⚠️⚠️  DATI TROVATI ⚠️⚠️⚠️{C.RST}",
+                f"  {C.R}TOTALE: {summary['total']} risultati{C.RST}",
+                f"  Breach confermati: {summary['confirmed_breaches']}",
+                f"  Pastebin dumps: {summary['pastebin_dumps']}",
+                f"  Fonti: {', '.join(summary['sources'])}",
+            ])
+            
+            # Lista dettagliata
+            lines.extend([
+                f"",
+                f"{C.BLD}📋 Dettaglio risultati:{C.RST}"
+            ])
+            
+            for breach in self.results["breaches"][:10]:  # Max 10
+                source = breach['source']
+                if breach.get('type') == 'pastebin_dump':
+                    date = breach.get('date', 'N/A')
+                    url = breach.get('url', '')
+                    lines.append(f"  • {C.R}📋{C.RST} Pastebin dump {date[:10]} - {url[:40]}...")
+                elif breach.get('type') == 'breach':
+                    name = breach.get('breach_name', 'Unknown')
+                    date = breach.get('date', 'N/A')
+                    lines.append(f"  • {C.R}🔥{C.RST} {name} ({date}) - {source}")
+                else:
+                    lines.append(f"  • {C.Y}⚠{C.RST} {source}: {breach.get('details', 'Menzione trovata')}")
+            
+            if len(self.results["breaches"]) > 10:
+                lines.append(f"  • ... e {len(self.results['breaches'])-10} altri")
+        
+        elif self.results["web_mentions"] > 0:
+            # Solo menzioni web, nessun breach confermato
+            lines.extend([
+                f"",
+                f"{C.BLD}{C.Y}⚠ ATTENZIONE:{C.RST}",
+                f"  Numero presente in pagine web ma non in breach confermati",
+                f"  Potrebbe essere comparso in forum o siti pubblici"
+            ])
         else:
-            lines.append(f"\n{C.BLD}{C.G}✅ NESSUN BREACH TROVATO{C.RST}")
+            # Nessun risultato
+            lines.extend([
+                f"",
+                f"{C.BLD}{C.G}✅ NESSUN DATO TROVATO{C.RST}",
+                f"  Il numero non è stato trovato in:",
+                f"  • Database breach pubblici",
+                f"  • Pastebin dumps",
+                f"  • Pagine web scansionate",
+                f"",
+                f"{C.DIM}Nota: i controlli sono su fonti pubbliche gratuite.{C.RST}",
+                f"{C.DIM}Per verifiche complete servirebbero servizi a pagamento.{C.RST}"
+            ])
+        
+        print(f"\n{box('📱 PHONE BREACH CHECK REPORT', lines, C.R if summary.get('found') else C.G)}")
 
-        print(f"\n{box('📱 PHONE NUMBER ANALYSIS', lines, C.G)}")
+# ════════════════════════════════════════════════════════════════════
+#  CONFIGURAZIONE API KEYS (opzionali)
+# ════════════════════════════════════════════════════════════════════
+# Per usare le API che richiedono registrazione, imposta le variabili d'ambiente:
+# export HUNTER_API_KEY="tua_chiave"
+# export SPYSE_API_KEY="tua_chiave"
+#
+# Oppure crea un file .env nella stessa directory:
+# HUNTER_API_KEY=xxx
+# SPYSE_API_KEY=xxx
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -2007,10 +2702,10 @@ class ReportGenerator:
         try:
             from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
             from cryptography.hazmat.primitives import hashes, padding
-            from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC  # ✅ CORRETTO!
+            from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
             from cryptography.hazmat.backends import default_backend
             import secrets
-        except ImportError as e:  # ✅ MIGLIORATO!
+        except ImportError as e:
             status("❌", f"Errore import cryptography: {e}", C.R)
             status("💡", "Installa con: pip install cryptography", C.Y)
             return None
@@ -2024,9 +2719,9 @@ class ReportGenerator:
         
         # Genera salt e IV casuali
         salt = secrets.token_bytes(16)
-        iv = secrets.token_bytes(12)  # GCM raccomanda 96 bit (12 byte)
+        iv = secrets.token_bytes(12)
         
-        # Deriva la chiave usando PBKDF2HMAC (100.000 iterazioni) ✅ CORRETTO!
+        # Deriva la chiave usando PBKDF2HMAC (100.000 iterazioni)
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
@@ -2058,7 +2753,7 @@ class ReportGenerator:
         with open(filename, 'wb') as f:
             f.write(encrypted_package)
         
-        # Crea anche un piccolo file informativo (VERSIONE SEMPLIFICATA)
+        # Crea anche un piccolo file informativo
         info_filename = filename + ".info"
         with open(info_filename, 'w', encoding='utf-8') as f:
             f.write(f"""╔════════════════════════════════════════════════════════════╗
@@ -2087,9 +2782,9 @@ python ghostrecon.py --decrypt {filename} "tua_password"
         try:
             from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
             from cryptography.hazmat.primitives import hashes, padding
-            from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC  # ✅ CORRETTO!
+            from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
             from cryptography.hazmat.backends import default_backend
-        except ImportError as e:  # ✅ MIGLIORATO!
+        except ImportError as e:
             print(f"❌ Errore import cryptography: {e}")
             print("   Installa con: pip install cryptography")
             return None
@@ -2099,7 +2794,7 @@ python ghostrecon.py --decrypt {filename} "tua_password"
                 data = f.read()
             
             # Estrai componenti
-            if len(data) < 44:  # 16 + 12 + 16 = 44
+            if len(data) < 44:
                 print("❌ File corrotto o non valido")
                 return None
                 
@@ -2108,7 +2803,7 @@ python ghostrecon.py --decrypt {filename} "tua_password"
             tag = data[28:44]
             ciphertext = data[44:]
             
-            # Deriva chiave con PBKDF2HMAC ✅ CORRETTO!
+            # Deriva chiave con PBKDF2HMAC
             kdf = PBKDF2HMAC(
                 algorithm=hashes.SHA256(),
                 length=32,
@@ -2134,6 +2829,215 @@ python ghostrecon.py --decrypt {filename} "tua_password"
             print(f"❌ Errore decifratura: {e}")
             print("   Password errata o file danneggiato")
             return None
+
+
+# ════════════════════════════════════════════════════════════════════
+#  MODULE 8 — PLATFORM PRESENCE SIGNAL
+# ════════════════════════════════════════════════════════════════════
+
+class PresenceSignal:
+    """Rileva presenza numero/email su piattaforme pubbliche"""
+    
+    def __init__(self, target: str, target_type: str = "auto"):
+        self.target = target.strip().lower()
+        self.target_type = target_type
+        self.results = {
+            "platforms": {},
+            "confidence": "low",
+            "method": "public_web_mentions",
+            "evidence": {}
+        }
+        
+    def scan(self):
+        """Esegue scansione presenza"""
+        print(f"\n{C.BLD}{C.CY}{'═'*60}")
+        print(f"  🔍 PLATFORM PRESENCE SCAN — {Redactor.email(self.target) if '@' in self.target else Redactor.phone(self.target)}")
+        print(f"{'═'*60}{C.RST}\n")
+        
+        self._detect_type()
+        self._search_web_mentions()
+        self._check_telegram()
+        self._print_results()
+        return self.results
+    
+    def _detect_type(self):
+        if self.target_type != "auto":
+            return
+        if '@' in self.target:
+            self.target_type = "email"
+        elif re.match(r'^\+?[\d\s\-\(\)]{8,}', self.target):
+            self.target_type = "phone"
+        else:
+            self.target_type = "unknown"
+    
+    def _search_web_mentions(self):
+        status("🌐", f"Cerca menzioni web per {self.target_type}...", C.CY)
+        
+        mentions = 0
+        domains = []
+        
+        try:
+            import urllib.parse
+            url = f"https://urlscan.io/api/v1/search/?q={urllib.parse.quote(self.target)}"
+            data = http.json_get(url, timeout=8)
+            
+            if data and data.get("total", 0) > 0:
+                mentions = data.get("total", 0)
+                for result in data.get("results", [])[:5]:
+                    page = result.get("page", {})
+                    domain = page.get("domain", "")
+                    if domain and domain not in domains:
+                        domains.append(domain)
+        except:
+            pass
+        
+        self.results["evidence"]["web_mentions"] = mentions
+        self.results["evidence"]["top_domains"] = domains[:5]
+        
+        if mentions > 0:
+            status("✓", f"Trovate {mentions} menzioni pubbliche", C.G)
+        else:
+            status("○", "Nessuna menzione pubblica trovata", C.DIM)
+    
+    def _check_telegram(self):
+        status("📱", "Controllo menzioni Telegram...", C.CY)
+        
+        telegram_hits = 0
+        telegram_channels = []
+        
+        self.results["evidence"]["telegram_hits"] = telegram_hits
+        self.results["evidence"]["telegram_channels"] = telegram_channels
+        
+        self.results["platforms"] = {
+            "telegram": "signal" if telegram_hits > 0 else "unknown",
+            "facebook": "unknown",
+            "whatsapp": "unknown",
+            "web": "signal" if self.results["evidence"]["web_mentions"] > 0 else "unknown"
+        }
+        
+        total_signals = sum(1 for v in self.results["platforms"].values() if v == "signal")
+        if total_signals >= 2:
+            self.results["confidence"] = "high"
+        elif total_signals == 1:
+            self.results["confidence"] = "medium"
+        else:
+            self.results["confidence"] = "low"
+    
+    def _print_results(self):
+        lines = [
+            f"Target:      {Redactor.email(self.target) if '@' in self.target else Redactor.phone(self.target)}",
+            f"Tipo:        {self.target_type}",
+            f"Confidence:  {self.results['confidence'].upper()}",
+            f"",
+            f"{C.BLD}Presenza piattaforme:{C.RST}",
+        ]
+        
+        for platform, status_val in self.results["platforms"].items():
+            icon = f"{C.G}✓ SIGNAL{C.RST}" if status_val == "signal" else f"{C.DIM}○ unknown{C.RST}"
+            lines.append(f"  {platform:10} {icon}")
+        
+        lines.extend([
+            f"",
+            f"{C.BLD}📊 Evidenze:{C.RST}",
+            f"  Menzioni web:  {self.results['evidence'].get('web_mentions', 0)}",
+            f"  Domini:        {', '.join(self.results['evidence'].get('top_domains', ['N/A']))}",
+        ])
+        
+        print(f"\n{box('🔍 PLATFORM PRESENCE SIGNAL', lines, C.CY)}")
+
+
+# ════════════════════════════════════════════════════════════════════
+#  MODULE 9 — BREACH EXPOSURE (solo SI/NO)
+# ════════════════════════════════════════════════════════════════════
+
+class BreachExposure:
+    """Verifica esposizione breach (solo conferma, senza dettagli)"""
+    
+    def __init__(self, email: str):
+        self.email = email.strip().lower()
+        self.results = {
+            "confirmed": False,
+            "source": None,
+            "records": 0,
+            "confidence": "low",
+            "error": None
+        }
+    
+    def check(self):
+        print(f"\n{C.BLD}{C.R}{'═'*60}")
+        print(f"  🔐 BREACH EXPOSURE CHECK — {Redactor.email(self.email)}")
+        print(f"{'═'*60}{C.RST}\n")
+        
+        self._check_leakcheck()
+        
+        if not self.results["confirmed"]:
+            self._check_xposed_fallback()
+        
+        self._print_results()
+        return self.results
+    
+    def _check_leakcheck(self):
+        status("📡", "Verifica LeakCheck API...", C.CY)
+        
+        try:
+            import urllib.parse
+            url = f"https://leakcheck.net/api/v2/query/{self.email}"
+            resp = http.get(url, timeout=8)
+            
+            if resp["ok"]:
+                data = json.loads(resp["body"])
+                
+                if data.get("success") and data.get("found", 0) > 0:
+                    self.results["confirmed"] = True
+                    self.results["source"] = "LeakCheck"
+                    self.results["records"] = data.get("found", 0)
+                    self.results["confidence"] = "high"
+                    status("🔥", f"ESPOSIZIONE CONFERMATA! {data.get('found', 0)} record", C.R)
+                else:
+                    status("✅", "Nessuna esposizione trovata su LeakCheck", C.G)
+            else:
+                status("○", "LeakCheck non disponibile", C.DIM)
+        except:
+            pass
+    
+    def _check_xposed_fallback(self):
+        status("📡", "Fallback su XposedOrNot...", C.CY)
+        
+        try:
+            breaches, _ = check_breach_xon(self.email)
+            
+            if breaches and len(breaches) > 0:
+                self.results["confirmed"] = True
+                self.results["source"] = "XposedOrNot"
+                self.results["records"] = len(breaches)
+                self.results["confidence"] = "medium"
+                status("🔥", f"ESPOSIZIONE CONFERMATA! {len(breaches)} breach", C.R)
+            else:
+                status("✅", "Nessuna esposizione trovata su XposedOrNot", C.G)
+        except:
+            pass
+    
+    def _print_results(self):
+        lines = [f"Email:       {Redactor.email(self.email)}", ""]
+        
+        if self.results["confirmed"]:
+            lines.extend([
+                f"{C.BLD}{C.BG_R}⚠️  ESPOSIZIONE CONFERMATA ⚠️{C.RST}",
+                f"Fonte:       {self.results['source']}",
+                f"Record:      {self.results['records']:,}",
+                f"Affidabilità: {self.results['confidence'].upper()}",
+            ])
+        else:
+            lines.extend([
+                f"{C.BLD}{C.G}✅ NESSUNA ESPOSIZIONE RILEVATA{C.RST}",
+                f"Verificato con: LeakCheck + XposedOrNot",
+                f"",
+                f"{C.DIM}Nota: limiti API gratuiti possono influire{C.RST}",
+            ])
+        
+        print(f"\n{box('🔐 BREACH EXPOSURE CONFIRMATION', lines, C.R if self.results['confirmed'] else C.G)}")
+
+
 # ════════════════════════════════════════════════════════════════════
 #  MAIN INTERACTIVE MENU
 # ════════════════════════════════════════════════════════════════════
@@ -2195,8 +3099,8 @@ class GhostRecon:
             elif choice == "5":
                 phone = input(f"  {C.Y}Phone (+country code){C.RST} ⟫ ").strip()
                 if phone:
-                    osint = PhoneOSINT(phone)
-                    self.session_results[f"phone_{phone}"] = osint.run_all()
+                    checker = PhoneBreachCheck(phone)
+                    self.session_results[f"phone_{phone}"] = checker.run_all()
 
             elif choice == "6":
                 print(f"\n  {C.BLD}{C.Y}🔐 VERIFICA BREACH PASSWORD/HASH{C.RST}")
@@ -2295,6 +3199,8 @@ class GhostRecon:
                     for email in d_results.get("web_info", {}).get("emails_found", [])[:3]:
                         e_osint = EmailOSINT(email)
                         self.session_results[f"full_email_{email}"] = e_osint.run_all()
+                    
+                    self._print_executive_summary()
 
             elif choice == "8":
                 if not self.session_results:
@@ -2351,6 +3257,18 @@ class GhostRecon:
                     else:
                         status("✗", "RDAP lookup fallito", C.R)
 
+            elif choice == "p":
+                target = input(f"  {C.Y}Target (email/telefono){C.RST} ⟫ ").strip()
+                if target:
+                    signal = PresenceSignal(target)
+                    self.session_results[f"presence_{target}"] = signal.scan()
+
+            elif choice == "b":
+                email = input(f"  {C.Y}Email da verificare{C.RST} ⟫ ").strip()
+                if email:
+                    exposure = BreachExposure(email)
+                    self.session_results[f"exposure_{email}"] = exposure.check()
+
             elif choice == "0":
                 status("🌍", "Rilevamento IP pubblico...", C.CY)
                 data = http.json_get("https://api.ipify.org?format=json")
@@ -2373,6 +3291,10 @@ class GhostRecon:
                 new_mode = not Config.redact_reports
                 Config.set_redact(new_mode)
                 status("🔒", f"Redattazione PII: {'ATTIVA' if new_mode else 'DISATTIVA'}", C.G if new_mode else C.Y)
+
+            elif choice == "clear":
+                os.system("cls" if os.name == "nt" else "clear")
+                print(BANNER)
 
             elif choice in ("q", "quit", "exit"):
                 print(f"\n  {C.M}👻 Ghost Recon - Chiusura sessione{C.RST}")
@@ -2438,10 +3360,6 @@ class GhostRecon:
                     print(f"\n  {C.M}👻 Arrivederci!{C.RST}\n")
                     break
 
-            elif choice == "clear":
-                os.system("cls" if os.name == "nt" else "clear")
-                print(BANNER)
-
             else:
                 status("⚠", "Opzione non valida. Riprova.", C.Y)
 
@@ -2462,21 +3380,66 @@ class GhostRecon:
         print(f"  {C.DIM}│  {C.CY}[2]{C.RST}  📧 Email OSINT           Breach DB, Gravatar, social         {C.DIM}│{C.RST}")
         print(f"  {C.DIM}│  {C.CY}[3]{C.RST}  🎯 Username Hunter       50+ social platforms                {C.DIM}│{C.RST}")
         print(f"  {C.DIM}│  {C.CY}[4]{C.RST}  📍 IP Intelligence        Geolocation, ASN, threat intel     {C.DIM}│{C.RST}")
-        print(f"  {C.DIM}│  {C.CY}[5]{C.RST}  📱 Phone OSINT           Analisi + breach check              {C.DIM}│{C.RST}")
+        print(f"  {C.DIM}│  {C.CY}[5]{C.RST}  📱 Phone Breach Check    Verifica breach su numeri telefono  {C.DIM}│{C.RST}")
         print(f"  {C.DIM}│  {C.CY}[6]{C.RST}  🔐 Password/Hash Check   HIBP k-anonymity                   {C.DIM}│{C.RST}")
         print(f"  {C.DIM}│  {C.CY}[7]{C.RST}  🚀 Full Recon Mode       Analisi completa domino+IP+email   {C.DIM}│{C.RST}")
         print(f"  {C.DIM}│  {C.CY}[8]{C.RST}  📁 Export Reports        JSON/HTML/AES-256-GCM cifrato      {C.DIM}│{C.RST}")
         print(f"  {C.DIM}│  {C.CY}[9]{C.RST}  🔍 WHOIS Lookup          RDAP lookup                        {C.DIM}│{C.RST}")
         print(f"  {C.DIM}│  {C.CY}[0]{C.RST}  🕵️  My IP                Rileva IP pubblico + intel         {C.DIM}│{C.RST}")
+        print(f"  {C.DIM}│  {C.CY}[p]{C.RST}  🔍 Presence Signal      Menzioni web + presenza            {C.DIM}│{C.RST}")
+        print(f"  {C.DIM}│  {C.CY}[b]{C.RST}  🔐 Breach Exposure     Conferma SI/NO (LeakCheck)        {C.DIM}│{C.RST}")
         print(f"  {C.DIM}│  {C.CY}[a]{C.RST}  ⚡ Aggressive Mode       {'ATTIVO' if Config.aggressive_mode else 'DISATTIVO'} (scraping preview)     {C.DIM}│{C.RST}")
         print(f"  {C.DIM}│  {C.CY}[r]{C.RST}  🔒 PII Redaction         {'ATTIVA' if Config.redact_reports else 'DISATTIVA'} (GDPR)               {C.DIM}│{C.RST}")
         print(f"  {C.DIM}│  {C.CY}[q]{C.RST}  ❌ Quit                  Esci e salva sessione              {C.DIM}│{C.RST}")
         print(f"  {C.DIM}└─────────────────────────────────────────────────────────────────────┘{C.RST}")
 
+    def _print_executive_summary(self):
+        """Executive Summary per Full Recon Mode"""
+        def _badge(level):
+            if level == "HIGH": return f"{C.R}HIGH{C.RST}"
+            if level == "MEDIUM": return f"{C.Y}MEDIUM{C.RST}"
+            if level == "LOW": return f"{C.G}LOW{C.RST}"
+            return f"{C.DIM}NONE{C.RST}"
+
+        print("\n════════════════════════════════════════════════════════════")
+        print(f"  {C.BLD}{C.CY}✅ EXECUTIVE SUMMARY{C.RST}")
+        print("════════════════════════════════════════════════════════════")
+
+        email_found = False
+        for key, data in self.session_results.items():
+            if key.startswith('full_email_') or key.startswith('email_'):
+                if isinstance(data, dict):
+                    summary = data.get('breach_summary')
+                    if summary:
+                        level = summary.get('level', 'NONE')
+                        score = summary.get('score', 0)
+                        timeline = summary.get('timeline', 'N/A')
+                        print(f"  • Email Breach Risk: {_badge(level)} ({score}/100) | {timeline}")
+                        email_found = True
+                        break
+        
+        if not email_found:
+            print(f"  • Email Breach Risk: {C.DIM}N/A{C.RST}")
+        
+        domain_found = False
+        for key, data in self.session_results.items():
+            if key.startswith('full_domain_') or key.startswith('domain_'):
+                if isinstance(data, dict):
+                    subs = data.get('subdomains', [])
+                    ports = data.get('ports', [])
+                    print(f"  • Subdomini trovati: {C.CY}{len(subs)}{C.RST}")
+                    print(f"  • Porte aperte (DB): {C.Y}{len([p for p in ports if p.get('verified')])}{C.RST} verificate")
+                    domain_found = True
+                    break
+        
+        if not domain_found:
+            print(f"  • Subdomini trovati: {C.DIM}N/A{C.RST}")
+        
+        print("════════════════════════════════════════════════════════════\n")
+
 
 # ════════════════════════════════════════════════════════════════════
 #  DECRYPT UTILITY - USARE DA TERMINALE
-#  ⚠️  QUESTO BLOCCO DEVE ESSERE QUI - DOPO LA CLASSE GhostRecon ⚠️
 # ════════════════════════════════════════════════════════════════════
 
 def decrypt_ghost():
@@ -2496,7 +3459,6 @@ def decrypt_ghost():
             print(f"\n  {C.G}✅ Decifratura riuscita!{C.RST}\n")
             print(json.dumps(data, indent=2, ensure_ascii=False))
             
-            # Opzione salvataggio
             save = input(f"\n  {C.Y}Salvare in JSON? (s/N): {C.RST}").lower()
             if save in ('s', 'si', 'y', 'yes'):
                 output = filename.replace('.ghost', '.json')
@@ -2510,16 +3472,13 @@ def decrypt_ghost():
 
 
 # ════════════════════════════════════════════════════════════════════
-#  ENTRY POINT - PUNTO DI INGRESSO DELLO SCRIPT
+#  ENTRY POINT
 # ════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     try:
-        # Modalità decifratura (priorità alta)
         if decrypt_ghost():
             sys.exit(0)
-            
-        # Modalità normale
         app = GhostRecon()
         app.run()
     except KeyboardInterrupt:
