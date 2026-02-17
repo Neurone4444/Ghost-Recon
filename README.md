@@ -1,107 +1,175 @@
-# Ghost-Recon
+Ghost-Recon
 
-Ghost Recon is an OSINT intelligence framework focused on public exposure analysis and defensive reconnaissance.
+Ghost Recon is an OSINT intelligence framework focused on public exposure analysis, breach signal correlation, and defensive reconnaissance.
 
-The framework collects and correlates publicly available information to evaluate exposure surface, breach signals, and security posture indicators. It is designed for defensive analysis only.
+The framework collects and correlates publicly available information to evaluate:
 
-Educational and authorized use only.
+Exposure surface
 
----
+Breach indicators
 
-## Requirements
+Incident signals
 
-- Python 3.9 or higher
-- Internet connection for public OSINT sources
+Security posture
 
----
+Risk scoring drivers
 
-## Features
+Designed strictly for defensive and authorized use.
 
+Core Capabilities
 Domain Intelligence
-- DNS resolution
-- SSL/TLS certificate inspection
-- HTTP security header analysis
-- Technology fingerprinting
-- Subdomain enumeration (public sources only)
-- Shodan InternetDB integration
-- URLScan visibility analysis
-- WHOIS (RDAP) lookup
-- Public port exposure visibility
+
+DNS resolution and record analysis
+
+SSL/TLS certificate inspection
+
+HTTP security header evaluation
+
+Technology fingerprinting
+
+Subdomain enumeration (public sources only)
+
+URLScan visibility analysis
+
+WHOIS / RDAP unified lookup
+
+Public port exposure visibility
+
+Domain risk scoring engine
 
 Email Intelligence
-- Email format validation
-- MX record verification
-- Disposable email detection
-- Public breach database check (XposedOrNot)
-- Exposure scoring and risk classification
+
+Format validation
+
+MX record verification
+
+Disposable email detection
+
+Public breach database check (XposedOrNot)
+
+Exposure scoring and classification
+
+Leak Intelligence Engine
+
+Noise-aware leak signal analysis:
+
+Paste and code repository monitoring
+
+Exposure signal weighting
+
+Strict target validation (email & domain only)
+
+Risk confidence scoring
+
+Proof-ready verification links
+
+Incident Intelligence (Pivot Engine)
+
+OSINT pivoting for:
+
+Ransomware mentions
+
+Data breach references
+
+Leak site indexing
+
+Infostealer exposure
+
+Credential theft indicators
+
+Cybersecurity media coverage
+
+Ransomware tracker correlation
+
+Includes:
+
+Smart dork refinement
+
+Self-site noise exclusion
+
+Multi-language pivoting
+
+Focused breach-relevance queries
 
 Username Hunter
-- Multi-platform username search (50+ platforms)
-- Response verification engine to reduce false positives
-- Exposure scoring
+
+50+ platform checks
+
+Response verification logic
+
+False positive reduction
+
+Exposure scoring
 
 Phone Intelligence
-- Public breach confirmation (optional API integration)
-- Exposure signal analysis
 
-Presence Signal Engine
-- Public web mention detection
-- Cross-platform exposure indicators
-- Confidence-based signal classification
+Public breach signal detection
+
+Exposure scoring
+
+Optional API integration
 
 Security Utilities
-- Password and hash check (HIBP k-anonymity)
-- PII redaction mode
-- Encrypted report export (AES-256-GCM)
-- Session persistence
 
-Full Recon Mode
-- Combined domain, IP, and email analysis workflow
+Password & hash check (HIBP k-anonymity)
 
----
+PII redaction mode
 
-## Installation
+AES-256-GCM encrypted reports
+
+Session persistence
+
+Safe / Aggressive mode separation
+
+Modes
+Safe Mode
+
+Low-noise, compliance-focused reconnaissance.
+
+Aggressive Mode
+
+Extended OSINT pivots and deeper exposure correlation
+(Still based only on public and legally accessible sources)
+
+Installation
 
 Clone the repository:
 
 git clone https://github.com/YOUR_USERNAME/Ghost-Recon.git
-
-Move into the directory:
-
 cd Ghost-Recon
 
-Install required dependency:
 
-python -m pip install cryptography
-
-If a requirements.txt file is present:
+Install dependencies:
 
 python -m pip install -r requirements.txt
 
----
 
-## Usage
+If needed:
+
+python -m pip install cryptography
+
+Usage
 
 Run the framework:
 
 python ghostrecon.py
 
+
 Decrypt encrypted report:
 
 python ghostrecon.py --decrypt filename.ghost your_password
 
----
-
-## Output
+Output
 
 Reports can be exported in:
-- JSON
-- HTML
-- Encrypted format (.ghost) using AES-256-GCM
 
----
+JSON
 
-## Legal Notice
+HTML
+
+Encrypted format (.ghost) using AES-256-GCM
+
+Legal Notice
 
 Ghost Recon is intended for defensive security analysis, research, and educational purposes.
 
