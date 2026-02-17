@@ -135,8 +135,9 @@ Installation
 
 Clone the repository:
 
-git clone https://github.com/YOUR_USERNAME/Ghostrecon.git
-cd Ghostrecon
+git clone https://github.com/YOUR_USERNAME/Ghost-Recon.git
+cd Ghost-Recon
+
 
 
 Install dependencies:
@@ -176,5 +177,6 @@ Ghost Recon is intended for defensive security analysis, research, and education
 Use only on domains, accounts, identities, and assets you are legally authorized to analyze.
 
 The author assumes no responsibility for misuse or unauthorized activity.
+
 
 
